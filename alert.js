@@ -8,7 +8,7 @@ function delay(ms) {
 const isMac = os.platform() === 'darwin';
 const isWin = os.platform() === 'win32';
 
-async function playAlert(msg) {
+async function playAlert(msg, repeats = 6) {
   msg = msg || 'Cupos disponibles, ingresa al sistema de lunas polarizadas y agenda tu cita';
 
   if (isMac) {
@@ -16,7 +16,7 @@ async function playAlert(msg) {
       if (err) console.error('Error playing sound:', err.message);
     });
     await delay(1000);
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < repeats; i++) {
       exec(`say '${msg}'`, (err) => {
         if (err) console.error('Error playing sound:', err.message);
       });

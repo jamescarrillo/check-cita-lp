@@ -12,6 +12,12 @@ const SEDE_VAL = '1';
 const SEDE_TXT = 'LIMA-LA VICTORIA';
 const EXPEDIENTE = '30709';
 const LOG_FILE = path.join(__dirname, 'logs.txt');
+const CAPTCHA_DIR = path.join(__dirname, 'captchas');
+const CONF_MIN = 90;
+const MAX_VENTANAS = 6;
+const MAX_ESPERA_MANUAL = 3 * 60 * 1000;
+
+let ventanasActivas = 0;
 
 function log(msg) {
   const line = `[${timestamp()}] ${msg}`;
@@ -26,6 +32,11 @@ function logRaw(msg) {
 
 function timestamp() {
   return new Date().toLocaleString('es-PE', { timeZone: 'America/Lima' });
+}
+
+function filenameTimestamp() {
+  const s = new Date().toLocaleString('es-PE', { timeZone: 'America/Lima', hour12: false });
+  return s.replace(/[/:,]/g, '-').replace(/\s+/g, '_');
 }
 
 function delay(ms) {
@@ -59,14 +70,98 @@ async function resolverCaptcha(page) {
       log('  Captcha no disponible (imagen vacia).');
       return '';
     }
+
+    const variantes = await page.evaluate(async (dataUrl) => {
+      const upscale = (scale) => new Promise((resolve) => {
+        const img = new Image();
+        img.src = dataUrl;
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          canvas.width = img.width * scale;
+          canvas.height = img.height * scale;
+          const ctx = canvas.getContext('2d');
+          ctx.imageSmoothingEnabled = false;
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          resolve(canvas.toDataURL('image/png'));
+        };
+        img.onerror = () => resolve(null);
+      });
+      return {
+        original: dataUrl,
+        scale3x: await upscale(3),
+        scale4x: await upscale(4),
+      };
+    }, src);
+
+    fs.mkdirSync(CAPTCHA_DIR, { recursive: true });
+    const fileName = path.join(CAPTCHA_DIR, `${filenameTimestamp()}.png`);
+    const base64 = src.replace(/^data:image\/\w+;base64,/, '');
+    fs.writeFileSync(fileName, Buffer.from(base64, 'base64'));
+    log(`  Captcha guardado en captchas/${path.basename(fileName)}`);
+
     const worker = await getWorker();
-    const { data } = await worker.recognize(src);
-    const limpio = (data.text || '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-    return limpio;
+    await worker.setParameters({
+      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+    });
+    const candidatos = [];
+    for (const [nombre, dataUrl] of Object.entries(variantes)) {
+      if (!dataUrl) continue;
+      const buffer = Buffer.from(dataUrl.replace(/^data:image\/\w+;base64,/, ''), 'base64');
+      for (const psm of [7, 8, 13]) {
+        await worker.setParameters({ tessedit_pageseg_mode: String(psm) });
+        const { data } = await worker.recognize(buffer);
+        const text = (data.text || '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+        if (!text) continue;
+        candidatos.push({ text, conf: data.confidence, via: nombre });
+        if (data.confidence >= CONF_MIN) {
+          log(`  OCR candidato rapido: "${text}" (${data.confidence.toFixed(0)}) via ${nombre}/psm${psm}`);
+          return { text, conf: data.confidence };
+        }
+      }
+    }
+    candidatos.sort((a, b) => b.conf - a.conf || b.text.length - a.text.length);
+    const limpio = candidatos[0]?.text || '';
+    const conf = candidatos[0]?.conf || 0;
+    log(`  OCR candidatos: ${candidatos.map(c => `"${c.text}"(${c.conf.toFixed(0)})`).join(' ')}`);
+    return { text: limpio, conf };
   } catch (err) {
     log(`  Error OCR captcha: ${err.message}`);
-    return '';
+    return { text: '', conf: 0 };
   }
+}
+
+const ERROR_RE = /incorrecto|inv[aá]lido|error|agot|no.*(pudo|cupo)|ya.*(registrad|tiene)/i;
+
+async function esperarCaptchaManual(page) {
+  log('  >>> COMPLETA LA CITA EN EL NAVEGADOR: escribe el captcha y haz click.');
+  log('  >>> Cierra la ventana del navegador cuando termines (o si no puedes).');
+  const inicio = Date.now();
+  while (Date.now() - inicio < MAX_ESPERA_MANUAL) {
+    if (page.isClosed()) {
+      log('  Ventana cerrada por el usuario. Ciclo terminado.');
+      return { ok: false, msg: 'Ventana cerrada por el usuario' };
+    }
+    let estado;
+    try {
+      estado = await leerEstadoDespuesDeEnvio(page);
+    } catch (err) {
+      log('  Ventana cerrada por el usuario. Ciclo terminado.');
+      return { ok: false, msg: 'Ventana cerrada por el usuario' };
+    }
+    if (estado.success && !ERROR_RE.test(estado.msg)) {
+      log(`  ✅ ${estado.msg}`);
+      return { ok: true, msg: estado.msg };
+    }
+    if (estado.noCupos) {
+      log(`  Cupos agotados mientras esperabas: ${estado.msg}`);
+      return { ok: false, msg: estado.msg };
+    }
+    log('  🔔 INGRESA CAPTCHA...');
+    await playAlert('INGRESA EL CAPTCHA EN EL NAVEGADOR PARA COMPLETAR TU CITA.', 1);
+    await delay(5000);
+  }
+  log('  Tiempo maximo de espera manual (3 min) alcanzado.');
+  return { ok: false, msg: 'Timeout de espera manual' };
 }
 
 async function leerHoras(page) {
@@ -128,16 +223,22 @@ async function leerEstadoDespuesDeEnvio(page) {
     if (lblValida && lblValida.innerText.trim()) {
       return { success: false, email: true, msg: lblValida.innerText.trim() };
     }
-    return { success: false, msg: 'Estado no detectado tras enviar captcha' };
+    const bodyText = (document.body?.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 500);
+    if (/no hay cupos|sin cupos/i.test(bodyText)) {
+      return { success: false, noCupos: true, msg: bodyText.slice(0, 300) || 'No hay cupos disponibles' };
+    }
+    return { success: false, msg: bodyText || 'Estado no detectado tras enviar captcha' };
   });
 }
 
 async function intentarConCaptcha(page, fechaTxt, horaTxt) {
   for (let intento = 1; intento <= 5; intento++) {
-    const captcha = await resolverCaptcha(page);
-    if (!captcha) {
-      await refrescarCaptcha(page);
-      continue;
+    const res = await resolverCaptcha(page);
+    let captcha = res.text;
+    if (!captcha || res.conf < CONF_MIN) {
+      log(`      OCR poco confiable (conf ${res.conf.toFixed(0)}).`);
+      log(`      >>> Dejando la cita en la pagina para que la completes manualmente.`);
+      return { ok: false, manual: true, msg: 'OCR no confiable, intervencion manual' };
     }
     log(`      Captcha OCR intento ${intento}: "${captcha}"`);
     await page.$eval('#MainContent_idUcitas_txtimg', el => { el.value = ''; });
@@ -194,13 +295,18 @@ async function intentarAgendar(page, fechaOptions) {
       if (resultado.ok) {
         return { ok: true, msg: `${fecha.text} ${hora.text} - ${resultado.msg}` };
       }
+      if (resultado.manual) {
+        return { ok: false, manual: true, msg: `${fecha.text} ${hora.text}` };
+      }
       if (resultado.email) {
+        log(`    Respuesta del sistema: ${resultado.msg}`);
         return { ok: false, email: true, msg: resultado.msg };
       }
       if (resultado.noCupos) {
-        log('    Cupos agotados para esta fecha, pasando a la siguiente...');
+        log(`    Cupos agotados para esta fecha: ${resultado.msg}`);
         break;
       }
+      log(`    Respuesta del sistema: ${resultado.msg}`);
     }
   }
   return { ok: false, msg: 'No se logro agendar ninguna cita' };
@@ -210,6 +316,12 @@ async function checkCupos() {
   logRaw(`\n═══════════════════════════════════════════════`);
   logRaw(`  Iteracion: ${timestamp()}`);
   logRaw(`═══════════════════════════════════════════════`);
+
+  if (ventanasActivas >= MAX_VENTANAS) {
+    log(`Limite de ${MAX_VENTANAS} ventanas activas alcanzado, saltando esta iteracion.`);
+    return;
+  }
+  ventanasActivas++;
 
   let browser;
   try {
@@ -286,20 +398,40 @@ async function checkCupos() {
         log(`  Cupos: ${cuposText}`);
         logRaw('========================================\n');
 
+        playAlert(`Cupos disponibles: ${cuposText}. Intentando agendar tu cita.`);
         log('Citas disponibles, intentando agendar automaticamente...');
         const resultado = await intentarAgendar(page, fechaOptions);
 
-        if (resultado.ok) {
+        if (resultado.manual) {
+          logRaw('\n========================================');
+          logRaw('  🙋  CAPTCHA MANUAL  🙋');
+          logRaw('========================================\n');
+          log(`  Completa la cita en el navegador: ${resultado.msg}`);
+          const manual = await esperarCaptchaManual(page);
+          if (manual.ok) {
+            logRaw('\n========================================');
+            logRaw('  ✅  CITA AGENDADA (MANUAL)  ✅');
+            logRaw('========================================\n');
+            log(`  Detalle: ${manual.msg}`);
+            await playAlert(`Cita agendada con exito: ${manual.msg}`, 3);
+            logRaw('\nNavegador abierto para que verifiques tu cita. Cerrando en 5 minutos...\n');
+            await delay(5 * 60 * 1000);
+          } else {
+            log(`No se completo la cita manualmente: ${manual.msg}`);
+            log('Continuando el monitoreo...');
+          }
+        } else if (resultado.ok) {
           logRaw('\n========================================');
           logRaw('  ✅  CITA AGENDADA  ✅');
           logRaw('========================================\n');
           log('Cita agendada con exito, revisa el detalle del tramite.');
           log(`  Detalle: ${resultado.msg}`);
-          await playAlert('Cita agendada con exito, revisa el detalle del tramite.');
+          await playAlert(`Cita agendada con exito: ${resultado.msg}`);
           logRaw('\nNavegador abierto para que verifiques tu cita. Cerrando en 5 minutos...\n');
           await delay(5 * 60 * 1000);
         } else {
           log(`No se pudo agendar: ${resultado.msg}`);
+          await playAlert(`No se pudo agendar la cita. ${resultado.msg}`);
           log('Las citas se agotaron o el captcha no se resolvio. Continuando el monitoreo...');
         }
       } else {
@@ -313,13 +445,14 @@ async function checkCupos() {
     log(`Error durante la verificacion: ${err.message}`);
   } finally {
     if (browser) await browser.close();
+    ventanasActivas--;
   }
 }
 
 const intervalArg = process.argv.find(a => a.startsWith('--interval='));
 const intervalSec = intervalArg
   ? parseInt(intervalArg.split('=')[1], 10)
-  : 120;
+  : 30;
 
 if (intervalSec > 0) {
   log(`Modo bucle: verificando cada ${intervalSec} segundo(s).`);
