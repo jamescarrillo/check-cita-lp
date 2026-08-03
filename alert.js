@@ -8,8 +8,8 @@ function delay(ms) {
 const isMac = os.platform() === 'darwin';
 const isWin = os.platform() === 'win32';
 
-async function playAlert() {
-  const msg = 'Cupos disponibles, ingresa al sistema de lunas polarizadas y agenda tu cita';
+async function playAlert(msg) {
+  msg = msg || 'Cupos disponibles, ingresa al sistema de lunas polarizadas y agenda tu cita';
 
   if (isMac) {
     exec('afplay /System/Library/Sounds/Glass.aiff', (err) => {
