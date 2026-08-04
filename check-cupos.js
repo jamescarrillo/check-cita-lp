@@ -5,19 +5,19 @@ const { createWorker } = require('tesseract.js');
 const { playAlert } = require('./alert');
 
 const URL = 'https://sistemas.policia.gob.pe/lunasoscurecidas/Solicitud_Menu.aspx';
-const DNI = '72155722';
+const DNI = '77777777';
 const DNI_MASK = DNI.slice(0, 3) + '*'.repeat(5);
-const CLAVE = 'jotace';
+const CLAVE = 'tu_clave';
 const SEDE_VAL = '1';
 const SEDE_TXT = 'LIMA-LA VICTORIA';
-const EXPEDIENTE = '30709';
+const EXPEDIENTE = '99999';
 const LOG_FILE = path.join(__dirname, 'logs.txt');
 const CAPTCHA_DIR = path.join(__dirname, 'captchas');
 const CONF_MIN = 90;
 const MAX_VENTANAS = 6;
-const MAX_ESPERA_MANUAL = 3 * 60 * 1000;
 
 let ventanasActivas = 0;
+let esperandoCaptchaManual = false;
 
 function log(msg) {
   const line = `[${timestamp()}] ${msg}`;
@@ -134,18 +134,19 @@ const ERROR_RE = /incorrecto|inv[aá]lido|error|agot|no.*(pudo|cupo)|ya.*(regist
 
 async function esperarCaptchaManual(page) {
   log('  >>> COMPLETA LA CITA EN EL NAVEGADOR: escribe el captcha y haz click.');
-  log('  >>> Cierra la ventana del navegador cuando termines (o si no puedes).');
-  const inicio = Date.now();
-  while (Date.now() - inicio < MAX_ESPERA_MANUAL) {
+  log('  >>> Las demas iteraciones estan DETENIDAS hasta que completes o cierres el navegador.');
+  log('  >>> Cierra la ventana del navegador si no puedes registrar la cita.');
+  let ultimaAlerta = 0;
+  while (true) {
     if (page.isClosed()) {
-      log('  Ventana cerrada por el usuario. Ciclo terminado.');
+      log('  Ventana cerrada por el usuario. Reanudando monitoreo.');
       return { ok: false, msg: 'Ventana cerrada por el usuario' };
     }
     let estado;
     try {
       estado = await leerEstadoDespuesDeEnvio(page);
     } catch (err) {
-      log('  Ventana cerrada por el usuario. Ciclo terminado.');
+      log('  Ventana cerrada por el usuario. Reanudando monitoreo.');
       return { ok: false, msg: 'Ventana cerrada por el usuario' };
     }
     if (estado.success && !ERROR_RE.test(estado.msg)) {
@@ -156,12 +157,13 @@ async function esperarCaptchaManual(page) {
       log(`  Cupos agotados mientras esperabas: ${estado.msg}`);
       return { ok: false, msg: estado.msg };
     }
-    log('  🔔 INGRESA CAPTCHA...');
-    await playAlert('INGRESA EL CAPTCHA EN EL NAVEGADOR PARA COMPLETAR TU CITA.', 1);
+    if (Date.now() - ultimaAlerta > 30000) {
+      log('  🔔 INGRESA CAPTCHA...');
+      await playAlert('INGRESA EL CAPTCHA EN EL NAVEGADOR PARA COMPLETAR TU CITA.', 1);
+      ultimaAlerta = Date.now();
+    }
     await delay(5000);
   }
-  log('  Tiempo maximo de espera manual (3 min) alcanzado.');
-  return { ok: false, msg: 'Timeout de espera manual' };
 }
 
 async function leerHoras(page) {
@@ -259,7 +261,7 @@ async function intentarConCaptcha(page, fechaTxt, horaTxt) {
     await refrescarCaptcha(page);
     await delay(500);
   }
-  return { ok: false, msg: `Agotados 5 intentos de captcha para ${fechaTxt} ${horaTxt}` };
+  return { ok: false, manual: true, msg: `No se resolvio el captcha en 5 intentos para ${fechaTxt} ${horaTxt}` };
 }
 
 async function intentarAgendar(page, fechaOptions) {
@@ -315,137 +317,254 @@ async function intentarAgendar(page, fechaOptions) {
 async function checkCupos() {
   logRaw(`\n═══════════════════════════════════════════════`);
   logRaw(`  Iteracion: ${timestamp()}`);
-  logRaw(`═══════════════════════════════════════════════`);
+  logRaw(`═══════════════════════════════════════════════\n`);
+
+  if (esperandoCaptchaManual) {
+    log('>>> Esperando ingreso manual del captcha. Iteraciones DETENIDAS, navegador abierto.');
+    return;
+  }
 
   if (ventanasActivas >= MAX_VENTANAS) {
     log(`Limite de ${MAX_VENTANAS} ventanas activas alcanzado, saltando esta iteracion.`);
     return;
   }
+
   ventanasActivas++;
 
   let browser;
+
   try {
     browser = await puppeteer.launch({ headless: false });
+
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 900 });
 
-    // 1. Login
+    // =====================================================
+    // LOGIN
+    // =====================================================
     log(`Iniciando sesion para el usuario DNI:${DNI_MASK}...`);
-    await page.goto(URL, { waitUntil: 'networkidle2', timeout: 30000 });
-    await delay(500);
+
+    await page.goto(URL, {
+      waitUntil: 'networkidle2',
+      timeout: 30000
+    });
 
     await page.select('#DdlDocumento', '1');
-    await delay(500);
     await page.type('#TxtCIP', DNI);
-    await delay(500);
     await page.type('#TxtClave', CLAVE);
-    await delay(500);
+
     await Promise.all([
-      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }),
-      page.click('#BtnContinuar'),
+      page.waitForNavigation({
+        waitUntil: 'networkidle2',
+        timeout: 20000
+      }),
+      page.click('#BtnContinuar')
     ]);
-    await delay(500);
+
     log('Sesion iniciada correctamente.');
 
-    // 2. Find expediente row and click action
-    log(`Ingresando a expediente ${EXPEDIENTE}...`);
+    // =====================================================
+    // ABRIR EXPEDIENTE
+    // =====================================================
+    log(`Ingresando al expediente ${EXPEDIENTE}...`);
+
     const actionLinkId = '#MainContent_gvProgramacion_btnAccion_0';
-    await page.waitForSelector(actionLinkId, { timeout: 10000 });
-    await delay(500);
+
+    await page.waitForSelector(actionLinkId, {
+      timeout: 10000
+    });
+
     await page.click(actionLinkId);
-    await delay(500);
 
-    // Wait for detail panel with "Reservar Cita" button
-    await page.waitForSelector('#MainContent_btnCita', { timeout: 10000 });
-    await delay(500);
+    // =====================================================
+    // ABRIR RESERVA DE CITA
+    // =====================================================
+    const btnCitaSelector = '#MainContent_btnCita';
+
+    const btnCita = await page.$(btnCitaSelector);
+
+    if (!btnCita) {
+      log('El expediente no esta en etapa de agendamiento.');
+      return;
+    }
+
     log(`Detalle del expediente ${EXPEDIENTE} cargado.`);
-
-    // 3. Click "Reservar Cita"
     log('Abriendo reserva de cita...');
-    await page.click('#MainContent_btnCita');
-    await delay(500);
 
-    // 4. Select sede
-    log(`Buscando Cupos Disponibles en ${SEDE_TXT}...`);
-    await page.select('#MainContent_idUcitas_cbosede', SEDE_VAL);
-    await delay(500);
+    await btnCita.click();
 
-    // 5. Read cupos from label
-    const cuposLabel = await page.$('#MainContent_idUcitas_lblcupos');
-    let cuposText = '';
-    if (cuposLabel) {
-      cuposText = await cuposLabel.evaluate(el => el.textContent.trim());
+    const sedeSelector = '#MainContent_idUcitas_cbosede';
+
+    try {
+      await page.waitForSelector(sedeSelector, {
+        timeout: 8000
+      });
+    } catch {
+      log('No fue posible abrir la ventana de reserva de cita.');
+      return;
     }
 
-    const fechaSelect = await page.$('#MainContent_idUcitas_cboFecha');
-    let fechaOptions = [];
-    if (fechaSelect) {
-      fechaOptions = await fechaSelect.evaluate(el =>
-        Array.from(el.options)
-          .filter(o => o.text && o.text !== 'Sin Cupos')
-          .map(o => ({ text: o.text, value: o.value }))
-      );
-    }
+    // =====================================================
+    // BUSCAR CUPOS
+    // =====================================================
+    log(`Buscando cupos disponibles en ${SEDE_TXT}...`);
 
-    const hayCupos = cuposText && cuposText.toLowerCase() !== 'sin cupos' && cuposText !== '';
+    await page.select(sedeSelector, SEDE_VAL);
 
-    log(`Cupos: "${cuposText}" | Fechas: [${fechaOptions.map(f => f.text).join(', ')}]`);
+    await delay(500);
 
+    const cuposText = await page
+      .$eval(
+        '#MainContent_idUcitas_lblcupos',
+        el => el.textContent.trim()
+      )
+      .catch(() => '');
+
+    const fechaOptions = await page
+      .$eval(
+        '#MainContent_idUcitas_cboFecha',
+        el =>
+          [...el.options]
+            .filter(o => o.text && o.text !== 'Sin Cupos')
+            .map(o => ({
+              text: o.text,
+              value: o.value
+            }))
+      )
+      .catch(() => []);
+
+    const hayCupos =
+      cuposText !== '' &&
+      cuposText.toLowerCase() !== 'sin cupos';
+
+    log(
+      `Cupos: "${cuposText}" | Fechas: [${fechaOptions
+        .map(f => f.text)
+        .join(', ')}]`
+    );
+
+    // =====================================================
+    // SI HAY CUPOS
+    // =====================================================
     if (hayCupos) {
-      if (enHorarioLaboral()) {
+
+      if (!enHorarioLaboral()) {
+        log('Cupos disponibles pero fuera de horario laboral (9:00-23:59).');
+        return;
+      }
+
+      logRaw('\n========================================');
+      logRaw('  🎉  ¡CUPOS DISPONIBLES!  🎉');
+      log(`  Cupos: ${cuposText}`);
+      logRaw('========================================\n');
+
+      playAlert(`Cupos disponibles: ${cuposText}. Intentando agendar tu cita.`);
+
+      log('Intentando agendar automaticamente...');
+
+      const resultado = await intentarAgendar(page, fechaOptions);
+
+      // =====================================================
+      // CAPTCHA MANUAL
+      // =====================================================
+      if (resultado.manual) {
+
+        esperandoCaptchaManual = true;
+
         logRaw('\n========================================');
-        logRaw('  🎉  ¡CUPOS DISPONIBLES!  🎉');
-        log(`  Cupos: ${cuposText}`);
+        logRaw('  🙋 CAPTCHA MANUAL 🙋');
         logRaw('========================================\n');
 
-        playAlert(`Cupos disponibles: ${cuposText}. Intentando agendar tu cita.`);
-        log('Citas disponibles, intentando agendar automaticamente...');
-        const resultado = await intentarAgendar(page, fechaOptions);
+        log(`Completa la cita en el navegador: ${resultado.msg}`);
+        log('Las iteraciones quedan detenidas hasta completar el captcha.');
 
-        if (resultado.manual) {
+        await playAlert(
+          'Hay cupos disponibles pero el captcha no se resolvio. COMPLETA LA CITA EN EL NAVEGADOR AHORA.',
+          3
+        );
+
+        const manual = await esperarCaptchaManual(page);
+
+        esperandoCaptchaManual = false;
+
+        if (manual.ok) {
+
           logRaw('\n========================================');
-          logRaw('  🙋  CAPTCHA MANUAL  🙋');
+          logRaw('  ✅ CITA AGENDADA (MANUAL) ✅');
           logRaw('========================================\n');
-          log(`  Completa la cita en el navegador: ${resultado.msg}`);
-          const manual = await esperarCaptchaManual(page);
-          if (manual.ok) {
-            logRaw('\n========================================');
-            logRaw('  ✅  CITA AGENDADA (MANUAL)  ✅');
-            logRaw('========================================\n');
-            log(`  Detalle: ${manual.msg}`);
-            await playAlert(`Cita agendada con exito: ${manual.msg}`, 3);
-            logRaw('\nNavegador abierto para que verifiques tu cita. Cerrando en 5 minutos...\n');
-            await delay(5 * 60 * 1000);
-          } else {
-            log(`No se completo la cita manualmente: ${manual.msg}`);
-            log('Continuando el monitoreo...');
-          }
-        } else if (resultado.ok) {
-          logRaw('\n========================================');
-          logRaw('  ✅  CITA AGENDADA  ✅');
-          logRaw('========================================\n');
-          log('Cita agendada con exito, revisa el detalle del tramite.');
-          log(`  Detalle: ${resultado.msg}`);
-          await playAlert(`Cita agendada con exito: ${resultado.msg}`);
-          logRaw('\nNavegador abierto para que verifiques tu cita. Cerrando en 5 minutos...\n');
+
+          log(`Detalle: ${manual.msg}`);
+
+          await playAlert(
+            `Cita agendada con exito: ${manual.msg}`,
+            3
+          );
+
+          logRaw('\nNavegador abierto para verificacion. Cerrando en 5 minutos...\n');
+
           await delay(5 * 60 * 1000);
+
         } else {
-          log(`No se pudo agendar: ${resultado.msg}`);
-          await playAlert(`No se pudo agendar la cita. ${resultado.msg}`);
-          log('Las citas se agotaron o el captcha no se resolvio. Continuando el monitoreo...');
+
+          log(`No se completo la cita manualmente: ${manual.msg}`);
+          log('Reanudando monitoreo.');
+
         }
-      } else {
-        log('Cupos disponibles pero fuera de horario laboral (9:00-23:59). Navegador cerrado.');
+
       }
+      // =====================================================
+      // AGENDADO AUTOMATICO
+      // =====================================================
+      else if (resultado.ok) {
+
+        logRaw('\n========================================');
+        logRaw('  ✅ CITA AGENDADA ✅');
+        logRaw('========================================\n');
+
+        log(`Detalle: ${resultado.msg}`);
+
+        await playAlert(
+          `Cita agendada con exito: ${resultado.msg}`
+        );
+
+        logRaw('\nNavegador abierto para verificacion. Cerrando en 5 minutos...\n');
+
+        await delay(5 * 60 * 1000);
+
+      }
+      // =====================================================
+      // ERROR AL AGENDAR
+      // =====================================================
+      else {
+
+        log(`No se pudo agendar: ${resultado.msg}`);
+
+        await playAlert(
+          `No se pudo agendar la cita. ${resultado.msg}`
+        );
+
+        log('Continuando el monitoreo...');
+
+      }
+
     } else {
+
       log(`Sin cupos en ${SEDE_TXT}`);
+
     }
 
   } catch (err) {
+
     log(`Error durante la verificacion: ${err.message}`);
+
   } finally {
-    if (browser) await browser.close();
+
+    if (browser) {
+      await browser.close();
+    }
+
     ventanasActivas--;
+
   }
 }
 
